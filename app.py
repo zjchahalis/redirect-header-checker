@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import os
+import time
 import zipfile
 
 import pandas as pd
@@ -15,11 +16,13 @@ import streamlit as st
 import botcheck as bc
 import demo_server
 import glossary as gl
+import hopmap as hm
 
 HARD_CAP = int(os.environ.get("MAX_URLS", "500"))
 LOCAL_OK = os.environ.get("ALLOW_PRIVATE_HOSTS") == "1"
 
 st.set_page_config(page_title="Redirect and Header Response Checker", layout="wide")
+st.html(hm.CSS)
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -204,7 +207,9 @@ def render_results(key: str, map_mode: bool) -> None:
         row = res[res.url == pick].iloc[0]
         st.markdown(f"**{int(row.hops)} redirect hop{'s' if int(row.hops) != 1 else ''}** · chain: {row.chain} · {row.chain_status}"
                     + (f" · expected hop: {row.hop_check}" if str(row.expected_type) != "" else ""))
-        hop_view = hops[hops.start_url == pick].drop(columns=["start_url"])
+        pick_hops = hops[hops.start_url == pick]
+        st.markdown(hm.map_only_panel(hm.chain_from_hops(pick, pick_hops.to_dict("records"))), unsafe_allow_html=True)
+        hop_view = pick_hops.drop(columns=["start_url"])
         if not out.get("http", True) and "protocol" in hop_view:
             hop_view = hop_view.drop(columns=["protocol"])
         show(hop_view)
@@ -234,7 +239,7 @@ def demo_banner(demo_on: bool, base_demo: str) -> None:
         st.info(f"Demo mode: testing a local server at {base_demo} with {len(demo_server.demo_items(base_demo))} deliberately broken URLs. Untick the demo box in the sidebar to test your own site.")
 
 
-t_how, t_urls, t_map, t_gloss = st.tabs(["1. How it works", "2. Check URLs", "3. Check a redirect map", "Glossary"])
+t_how, t_urls, t_map, t_trace, t_gloss = st.tabs(["1. How it works", "2. Check URLs", "3. Check a redirect map", "4. Trace http and https", "Glossary"])
 
 with t_how:
     st.markdown("""
@@ -244,6 +249,8 @@ with t_how:
 
 - **2. Check URLs** is for spot checks and audits. Paste URLs, or upload a **Screaming Frog Internal: All export** (Internal tab, filter All, Export) to test its URLs and compare its status codes with what the live site says now. You get every check that applies: chain, status, HTTP version, HSTS, robots.txt, noindex, canonical and more.
 - **3. Check a redirect map** is for migrations. Upload a CSV with `Source`, `Type` and `Target` columns: the old URL, the redirect type you expect (301, 302, 307, 308, or 404/410 for pages that should be gone) and the new URL. `Type` is optional. You get all of the above plus whether the expected redirect hop actually happens and where it lands compared with your map. The embeddings mapping and the PageRank tool both produce this file.
+
+- **4. Trace http and https** is for one site's front door. Type a URL and it requests the http and https versions, on the host you typed and the www or non-www twin, then draws every redirect hop on a map so you can see at a glance whether all four entry points land on one final URL. It lists what is wrong with each (temporary first redirect, no HSTS, a downgrade to http, a split between final URLs) and keeps the raw response headers of every hop. The step-by-step view in tabs 2 and 3 draws the same map for any URL you pick.
 
 If your files hold paths only, enter the site's base URL.
 
@@ -325,6 +332,99 @@ with t_map:
     if st.session_state.get("bc_map") is None:
         st.info("Upload a redirect map (or tick the demo in the sidebar), then press Check the redirect map.")
     render_results("bc_map", map_mode=True)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def preload_lookup(domain: str) -> str:
+    return hm.preload_status(domain)
+
+
+with t_trace:
+    demo_on = bool(st.session_state.get("use_demo"))
+    base_demo = demo() if demo_on else ""
+    demo_banner(demo_on, base_demo)
+    st.write("Request the http and https versions of a URL, plus the www or non-www twin, and see every redirect hop on one map. "
+             "Requests go out exactly as typed: no HSTS cache and no browser upgrade, so http:// really hits port 80. "
+             "It uses the crawler chosen in the sidebar.")
+    tr_mode = st.radio("What to trace", ["One URL", "A list of URLs"], horizontal=True, key="tr_mode", label_visibility="collapsed")
+    with st.expander("Trace options"):
+        o1, o2 = st.columns(2)
+        tr_method = o1.radio("Request method", ["GET", "HEAD"], horizontal=True, key="tr_method",
+                             help="GET also reads the page so the title, canonical, robots tags and a text comparison between final pages are available. HEAD is lighter and skips those.")
+        tr_alt = o1.checkbox("Also try the www or non-www host", True, key="tr_alt",
+                             help="Adds the other host (www.example.com for example.com and the reverse) so all four entry points are tested.")
+        tr_tls = o2.checkbox("Verify TLS certificates", True, key="tr_tls", help="Untick to follow a chain through a site with an expired or mismatched certificate.")
+        tr_pre = o2.checkbox("Check the HSTS preload list", True, key="tr_pre", help="Asks hstspreload.org whether the domain is on the browser preload list (one lookup per run).")
+        tr_xh = st.text_area("Extra request headers (one per line)", key="tr_xh", height=70, placeholder="X-Forwarded-Proto: http\nCache-Control: no-cache",
+                             help="Sent with every request, for example to test how a CDN or load balancer reacts.")
+
+    def tr_opts():
+        cfg = make_cfg(demo_on, base_demo)
+        xh = {}
+        for line in tr_xh.splitlines():
+            if ":" in line and line.split(":", 1)[0].strip():
+                k, v = line.split(":", 1)
+                xh[k.strip()] = v.strip()
+        return cfg, hm.TraceOptions(cfg=cfg, method=tr_method, include_alt_host=tr_alt, verify_tls=tr_tls, extra_headers=xh,
+                                    read_body=(tr_method == "GET"))
+
+    if tr_mode == "One URL":
+        with st.form("tr_form", border=False):
+            f1, f2 = st.columns([6, 1], vertical_alignment="bottom")
+            tr_url = f1.text_input("URL or hostname", key="tr_url", placeholder="example.com/some/page")
+            go = f2.form_submit_button("Trace", type="primary", use_container_width=True)
+        if demo_on:
+            st.caption(f"Demo server: try {base_demo}/old/chain")
+        if go:
+            if not hm.build_variants(tr_url, tr_alt):
+                st.error("Enter a URL or hostname.")
+            else:
+                cfg, opts = tr_opts()
+                limiter = bc.HostLimiter(cfg.interval)
+                protocols = bc.ProtocolCache(cfg, limiter) if check_http else None
+                t0 = time.perf_counter()
+                with st.spinner("Tracing..."):
+                    chains = hm.trace_url(tr_url, opts, limiter, protocols)
+                    pre = None
+                    if tr_pre and chains and not demo_on:
+                        host = chains[0].host
+                        apex = host[4:] if host.startswith("www.") else host
+                        if "." in apex:
+                            pre = (apex, preload_lookup(apex))
+                st.session_state["tr_single"] = dict(chains=chains, findings=hm.analyze(chains), elapsed=time.perf_counter() - t0,
+                                                     preload=pre, method=tr_method, bot=bot_name)
+        out = st.session_state.get("tr_single")
+        if out:
+            st.caption(f"Traced as {out['bot']}.")
+            top, log = hm.single_panel(out["chains"], out["findings"], out["elapsed"], out["preload"], out["method"])
+            st.markdown(top, unsafe_allow_html=True)
+            st.markdown(log, unsafe_allow_html=True)
+        else:
+            st.info("Type a URL or hostname and press Trace.")
+    else:
+        tr_text = st.text_area("URLs, one per line", key="tr_text", height=160, placeholder="example.com\nexample.com/pricing\nhttp://www.example.org/")
+        urls = list(dict.fromkeys(u.strip() for u in tr_text.splitlines() if u.strip()))
+        if len(urls) > max_urls:
+            st.warning(f"{len(urls):,} URLs entered. Only the first {max_urls:,} will be traced (change the limit in the sidebar).")
+            urls = urls[:max_urls]
+        if st.button("Trace all", type="primary", disabled=not urls, key="tr_run") and urls:
+            cfg, opts = tr_opts()
+            opts.read_body = False
+            limiter = bc.HostLimiter(cfg.interval)
+            protocols = bc.ProtocolCache(cfg, limiter) if check_http else None
+            bar = st.progress(0.0, text="Starting...")
+            t0 = time.perf_counter()
+            res = hm.run_list(urls, opts, limiter, protocols, workers=min(8, max(2, rps)),
+                              progress=lambda i, n: bar.progress(i / n, text=f"Traced {i} of {n}"))
+            bar.empty()
+            st.session_state["tr_list"] = dict(results=res, elapsed=time.perf_counter() - t0)
+        out = st.session_state.get("tr_list")
+        if out:
+            st.markdown(hm.matrix_html(out["results"], out["elapsed"]), unsafe_allow_html=True)
+            st.download_button("Download CSV", pd.DataFrame([r for r, _, _ in out["results"]]).to_csv(index=False).encode("utf-8"),
+                               "trace_results.csv", mime="text/csv", key="tr_dl")
+        else:
+            st.info("Enter some URLs and press Trace all. Each URL is requested up to four ways, so a long list takes a while.")
+
 
 with t_gloss:
     st.write("Every finding in plain English, with the usual fix. The results tables also have a hover tooltip on every column heading.")

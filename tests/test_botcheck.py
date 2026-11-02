@@ -201,7 +201,7 @@ def test_streamlit_app_runs_demo():
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
     at.run()
     assert not at.exception
-    assert [t.label for t in at.tabs][:4] == ["1. How it works", "2. Check URLs", "3. Check a redirect map", "Glossary"]
+    assert [t.label for t in at.tabs][:5] == ["1. How it works", "2. Check URLs", "3. Check a redirect map", "4. Trace http and https", "Glossary"]
     at.sidebar.checkbox(key="use_demo").check()
     at.run()
     # one-off URL tab: no map columns, no map metric
@@ -219,6 +219,12 @@ def test_streamlit_app_runs_demo():
     assert any(m.label == "Expected hop happened" for m in at.metric)
     shown = at.multiselect(key=[k for k in [m.key for m in at.multiselect] if k and k.startswith("bc_map_cols_")][0]).value
     assert {"expected_type", "expected", "hop_check", "target_match", "http_version"} <= set(shown) and "curl" not in shown
+    # trace tab: map for one URL on the demo server
+    at.text_input(key="tr_url").set_value(srv_url_for_app(at) + "/old/chain")
+    [b for b in at.button if b.label == "Trace"][0].click()
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any("w-svg" in m.value for m in at.markdown)
 
 
 def test_protocol_probe_failure_is_explained(monkeypatch):
@@ -344,3 +350,96 @@ def test_alt_svc_h3_detection_and_probe_guard():
     cfg = bc.Config(interval=0.0)
     pc = bc.ProtocolCache(cfg, bc.HostLimiter(0))
     assert pc._probe("https://127.0.0.1/") == "unknown"                                      # private address is never probed
+
+
+# ---------------------------------------------------------------- hop map and tracer (hopmap.py)
+import hopmap as hm  # noqa: E402
+
+
+def srv_url_for_app(at):
+    import re
+    banner = " ".join(i.value for i in at.info)
+    return re.search(r"http://127\.0\.0\.1:\d+", banner).group(0)
+
+
+def trace(srv, path, **kw):
+    cfg = bc.Config(allowed_hosts=(srv.split("//")[1],), interval=0.0)
+    opts = hm.TraceOptions(cfg=cfg, **kw)
+    return hm.trace_url(srv + path, opts, bc.HostLimiter(0))
+
+
+def test_build_variants():
+    v = hm.build_variants("ipullrank.com/a?b=1")
+    assert [x[1] for x in v] == ["http", "https", "http-alt", "https-alt"]
+    assert v[0][2] == "http://ipullrank.com/a?b=1" and v[2][2] == "http://www.ipullrank.com/a?b=1"
+    assert hm.build_variants("https://www.x.com")[2][2] == "http://x.com/"
+    assert len(hm.build_variants("example.com", include_alt_host=False)) == 2
+    assert len(hm.build_variants("http://127.0.0.1:8000/x")) == 1 and len(hm.build_variants("localhost")) == 2   # port or no dot: no twin host
+    assert hm.build_variants("") == [] and hm.build_variants("ftp://x.com") == []
+
+
+def test_trace_findings_and_raw_headers(srv):
+    ch = trace(srv, "/old/temporary")
+    assert len(ch) == 1 and ch[0].codes == "302 > 200"
+    assert ch[0].hops[0].header("Location").endswith("/new/temporary") and ch[0].hops[0].headers      # raw headers kept
+    msgs = " | ".join(f.msg for f in hm.analyze(ch))
+    assert "temporary" in msgs and "plain HTTP without redirecting" in msgs and "canonical points to HTTP" in msgs
+    loop = trace(srv, "/old/loop-a")
+    assert any(f.sev == "error" and "loop" in f.msg.lower() for f in hm.analyze(loop))
+    assert any("noindex" in f.msg for f in hm.analyze(trace(srv, "/old/staging-leak")))
+    assert any("HSTS over plain" in f.msg or "Strict-Transport-Security over plain HTTP" in f.msg for f in hm.analyze(trace(srv, "/old/hsts-http")))
+
+
+def test_trace_respects_safety_and_head_method(srv):
+    cfg = bc.Config(interval=0.0)                                              # demo host is not allowed here
+    ch = hm.trace_url(srv + "/old/clean", hm.TraceOptions(cfg=cfg), bc.HostLimiter(0))[0]
+    assert ch.hops[0].status is None and ch.error.startswith("Blocked")
+    head = trace(srv, "/old/clean", method="HEAD", read_body=False)[0]
+    assert head.final_status == 200 and not head.page
+
+
+def test_findings_on_synthetic_chains():
+    H = hm.Hop
+    def chain(slot, hops):
+        return hm.Chain(slot.upper(), slot, slot.split("-")[0], hops[0].url, hops, hops[-1].url, hops[-1].status)
+    down = chain("https", [H("https://a.com/", 302, location="http://a.com/x"), H("http://a.com/x", 200)])
+    msgs = [(f.sev, f.msg) for f in hm.analyze([down])]
+    assert any(s == "error" and "Downgrades" in m for s, m in msgs) and any("no Strict-Transport-Security" in m for _, m in msgs)
+    weak = chain("https", [H("https://a.com/", 200, headers=[("Strict-Transport-Security", "max-age=300")])])
+    assert any("under the one year" in f.msg for f in hm.analyze([weak]))
+    good = chain("https", [H("https://a.com/", 200, headers=[("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")])])
+    assert any(f.sev == "ok" for f in hm.analyze([good]))
+    a = chain("http", [H("http://a.com/", 301, location="https://a.com/"), H("https://a.com/", 200)])
+    b = chain("http-alt", [H("http://www.a.com/", 301, location="https://a.com//"), H("https://a.com//", 200)])
+    assert any("split across 2 final URLs" in f.msg for f in hm.analyze([a, b]))
+    assert any("changes the host" in f.msg for f in hm.analyze([chain("http", [H("http://www.a.com/", 301, location="https://a.com/"), H("https://a.com/", 200)])]))
+
+
+def test_map_html_is_markdown_safe_and_escaped(srv):
+    ch = trace(srv, "/old/chain")
+    top, log = hm.single_panel(ch, hm.analyze(ch), 0.5, ("demo", "unknown"), "GET")
+    for part in (top, log):
+        assert "\n\n" not in part and part.startswith('<div class="hm">')           # a blank line would end the HTML block
+    assert top.count("<svg") == 1 and "m-fin" in top and "Four" not in top and "One entry point" in top
+    evil = hm.Chain("X", "http", "http", "http://a.com/<script>", [hm.Hop("http://a.com/<script>", 200, "OK<b>")], "http://a.com/<script>", 200)
+    html_out = hm.single_panel([evil], [], 0.1, None, "GET")
+    assert "<script>" not in html_out[0] + html_out[1]
+
+
+def test_chain_from_hops_draws_existing_results(srv):
+    df, hops = run(srv, [dict(url=srv + "/old/chain", expected="", expected_type="")])
+    c = hm.chain_from_hops(df.url.iloc[0], hops.to_dict("records"))
+    assert c.codes == "301 > 301 > 200" and c.redirects == 2 and c.final_url.endswith("/new/chain")
+    assert hm.map_only_panel(c).count("<svg") == 1
+    err = hm.chain_from_hops("http://x.test/", [dict(url="http://x.test/", status=None, location="", ms=0, note="timeout")])
+    assert err.codes == "ERR" and "m-x" in hm.map_only_panel(err)
+
+
+def test_list_mode_matrix(srv):
+    cfg = bc.Config(allowed_hosts=(srv.split("//")[1],), interval=0.0)
+    urls = [srv + "/old/clean", srv + "/old/chain", srv + "/old/error"]
+    res = hm.run_list(urls, hm.TraceOptions(cfg=cfg, read_body=False), bc.HostLimiter(0), workers=3)
+    assert [r["input"] for r, _, _ in res] == urls                                # input order kept
+    assert res[1][0]["http chain"] == "301 > 301 > 200"
+    out = hm.matrix_html(res, 1.0)
+    assert "3 URLs traced" in out and "<table" in out and "\n\n" not in out
