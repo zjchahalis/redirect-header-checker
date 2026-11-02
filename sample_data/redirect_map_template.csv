@@ -1,0 +1,5 @@
+Source,Type,Target
+https://www.example.com/old-page,301,https://www.example.com/new-page
+https://www.example.com/old-category/,301,https://www.example.com/category/
+https://www.example.com/promo-2020,302,https://www.example.com/promo/
+https://www.example.com/discontinued-product,410,
