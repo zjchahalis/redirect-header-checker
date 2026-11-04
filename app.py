@@ -94,6 +94,24 @@ check_hsts = st.sidebar.checkbox("Check HSTS", value=True,
 check_robots = st.sidebar.checkbox("Check robots.txt", value=True,
                                    help="Reads each site's robots.txt with Google's matching rules and flags old URLs the crawler is not allowed to fetch "
                                         "(so it never sees the redirect), blocked destinations, and a robots.txt that errors. Turn off to skip these checks and the extra requests.")
+with st.sidebar.expander("Cookie and headers (sites behind a bot challenge)"):
+    st.caption("If a host answers with a CAPTCHA or JavaScript challenge, open the site in your own browser, pass it, then copy the cookie it set "
+               "(DevTools, Application, Cookies, or the Cookie request header on the Network tab) and paste it here. Only paste a cookie that passes a bot "
+               "check, never a logged-in session. It is kept in memory for this session only and sent only to the domain you enter below. "
+               "Challenge cookies are often tied to your IP address and browser, so this works best when the tool runs on your own computer, and you should "
+               "set the user agent to Custom with the same string your browser uses.")
+    ck_domain = st.text_input("Send only to this domain", placeholder="integrityenergy.com", help="Also covers its subdomains, such as www. Required for the cookie and headers to be sent.")
+    ck_cookie = st.text_input("Cookie", type="password", placeholder="sgcaptcha=...; other=...")
+    ck_extra = st.text_area("Extra request headers (one per line)", height=70, placeholder="X-Check-Token: abc123",
+                            help="For example a secret header your host or firewall is set to allow.")
+    ck_headers = {}
+    for _line in ck_extra.splitlines():
+        if ":" in _line:
+            _k, _v = _line.split(":", 1)
+            if _k.strip():
+                ck_headers[_k.strip()] = _v.strip()
+    if (ck_cookie or ck_headers) and not ck_domain.strip():
+        st.warning("Enter the domain so the cookie and headers are sent.")
 max_urls = st.sidebar.slider("Maximum URLs per run", 10, HARD_CAP, min(200, HARD_CAP), help=f"A hosted copy is capped at {HARD_CAP} URLs per run.")
 allow_private = False
 if LOCAL_OK:
@@ -123,7 +141,8 @@ def make_cfg(demo_on: bool, base_demo: str = ""):
     return bc.Config(ua=bot["ua"], token=bot["token"], frm=bot["frm"], connect_timeout=min(5.0, float(timeout)),
                      read_timeout=float(timeout), interval=1.0 / rps, allow_private=allow_private, slow_ms=int(slow_ms),
                      check_robots=check_robots, follow_chain=follow_chain, check_hsts=check_hsts, check_http_version=check_http,
-                     honors_robots=bot["robots"] == "yes", allowed_hosts=((base_demo.split("//")[1],) if demo_on else ()))
+                     honors_robots=bot["robots"] == "yes", allowed_hosts=((base_demo.split("//")[1],) if demo_on else ()),
+                     cookie=ck_cookie.strip(), extra_headers=ck_headers, header_domain=ck_domain.strip())
 
 
 def run_block(key: str, items: list, demo_on: bool, base_demo: str, label: str) -> None:

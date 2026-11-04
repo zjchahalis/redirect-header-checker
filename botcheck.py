@@ -136,6 +136,7 @@ ISSUES: Dict[str, Tuple[str, str, str]] = {
     "ROBOTS_BLOCKED_DEST": ("error", "Destination blocked by robots.txt", "A URL in the chain, usually the destination, is disallowed in robots.txt. The crawler cannot fetch the page it is sent to."),
     "ROBOTS_UNAVAILABLE": ("warn", "robots.txt unreachable", "robots.txt returned a server error or timed out. Google treats that as 'do not crawl' for a while, so crawling can stall."),
     "BOT_REFUSED": ("error", "Refuses the crawler (401/403/429)", "The server answers the crawler with an access or rate-limit error. Often a firewall or bot rule. Real crawlers verify by IP, so also check your logs."),
+    "BOT_CHALLENGE": ("error", "Host served a bot challenge, not the real page", "The hosting or security layer answered the crawler with a CAPTCHA or JavaScript challenge (often with a 202, 403 or 503) instead of the site's real response, so this result says nothing about your redirects. Options: pass the challenge in your own browser and paste the resulting cookie into the sidebar (Cookie and headers), allowlist the checker's IP in the host's bot protection, or test with a different user agent. These cookies are often tied to the IP and user agent that earned them, so a copy of the tool running on your own computer is the most reliable. Real Googlebot is usually verified by IP and may be treated differently, so confirm in your server logs."),
     "NOT_FOUND": ("error", "Ends on 404 or 410", "The redirect leads to a missing page, or the old URL simply returns 404 and has no redirect."),
     "SERVER_ERROR": ("error", "Ends on a server error (5xx)", "The crawler gets a 5xx. Repeated errors reduce crawling and can drop pages from the index."),
     "OTHER_STATUS": ("error", "Ends on an unexpected status", "The final response is not a 200 page and not a normal error. Check what the server is doing."),
@@ -297,6 +298,9 @@ class Config:
     honors_robots: bool = True             # False for agents that act on a person's request and ignore robots.txt
     check_http_version: bool = True        # report HTTP/1.1, HTTP/2 and whether HTTP/3 is advertised
     check_hsts: bool = True                # report the Strict-Transport-Security header (optional)
+    cookie: str = ""                       # Cookie header value copied from a browser that passed the host's bot challenge
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    header_domain: str = ""                # cookie and extra headers go only to this domain and its subdomains, never to other hosts
 
     def __post_init__(self):
         self.max_hops = max(1, min(MAX_HOPS_CAP, int(self.max_hops)))
@@ -341,11 +345,21 @@ def _session() -> requests.Session:
     return s
 
 
-def _headers(cfg: Config) -> Dict[str, str]:
+def _domain_match(host: str, domain: str) -> bool:
+    host, domain = host.split(":")[0].lower().strip("."), domain.lower().strip(".")
+    return bool(domain) and (host == domain or host.endswith("." + domain))
+
+
+def _headers(cfg: Config, url: str = "") -> Dict[str, str]:
     h = {"User-Agent": cfg.ua, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
          "Accept-Encoding": "gzip, deflate"}
     if cfg.frm:
         h["From"] = cfg.frm
+    # a pasted cookie or header is only sent to the domain it was meant for, so a redirect to a third party never receives it
+    if url and (cfg.cookie or cfg.extra_headers) and _domain_match(urlsplit(url).netloc, cfg.header_domain):
+        h.update(cfg.extra_headers)
+        if cfg.cookie:
+            h["Cookie"] = cfg.cookie
     return h
 
 
@@ -357,7 +371,7 @@ def _get(url: str, cfg: Config, limiter: HostLimiter, read_body: bool = False):
         limiter.wait(host)
         t0 = time.monotonic()
         try:
-            r = _session().get(url, headers=_headers(cfg), allow_redirects=False, stream=True,
+            r = _session().get(url, headers=_headers(cfg, url), allow_redirects=False, stream=True,
                                timeout=(cfg.connect_timeout, cfg.read_timeout))
             body = ""
             if read_body and r.status_code not in REDIRECT_CODES:
@@ -411,7 +425,7 @@ class ProtocolCache:
         for _attempt in range(2):                            # one retry: a first failure is often a dropped connection
             self.limiter.wait(urlsplit(url).netloc)
             try:
-                client = httpx.Client(http2=True, trust_env=False, follow_redirects=False, headers=_headers(self.cfg),
+                client = httpx.Client(http2=True, trust_env=False, follow_redirects=False, headers=_headers(self.cfg, url),
                                       timeout=httpx.Timeout(self.cfg.read_timeout, connect=self.cfg.connect_timeout))
             except ImportError:
                 return "unknown (HTTP/2 support missing: pip install \"httpx[http2]\")"
@@ -590,6 +604,24 @@ def hsts_assess(scheme: str, header: str, status: Optional[int]) -> Tuple[str, s
     return (f"ok: max-age {ma}{flags}{ready}", "")
 
 
+def challenge_vendor(headers, status) -> str:
+    """Name the bot-protection layer if the response is a CAPTCHA or JavaScript challenge rather than the site's own page."""
+    h = {k.lower(): str(v) for k, v in headers.items()}
+    if h.get("sg-captcha"):
+        return "SiteGround"
+    if h.get("cf-mitigated", "").lower() == "challenge":
+        return "Cloudflare"
+    if "x-datadome" in h or "x-datadome-response" in h:
+        return "DataDome"
+    if any(k.startswith("x-sucuri") for k in h) and status in (202, 403, 503):
+        return "Sucuri"
+    if "x-iinfo" in h and status in (403, 503):
+        return "Imperva"
+    if status in (202, 403, 429, 503) and "captcha" in " ".join(h.get(k, "") for k in ("x-robots-tag", "server", "via", "x-cdn")).lower():
+        return "a bot-protection service"
+    return ""
+
+
 def curl_command(url: str, cfg: Config) -> str:
     """The curl command that shows the same hop-by-hop headers (use curl.exe in PowerShell, NUL for /dev/null on Windows)."""
     ua = cfg.ua.replace('"', "'")
@@ -602,6 +634,7 @@ def check_url(url: str, cfg: Config, limiter: HostLimiter, robots: RobotsCache, 
     seen, cur = {norm(url)}, url
     loop = too_many = not_followed = False
     err_code, final, body, final_ms = "", None, "", 0
+    challenged = ""
     for i in range(cfg.max_hops + 1):
         ok, why = check_address(cur, cfg.allow_private, cfg.allowed_hosts)
         if not ok:
@@ -614,7 +647,9 @@ def check_url(url: str, cfg: Config, limiter: HostLimiter, robots: RobotsCache, 
             err_code = "TIMEOUT" if err == "timeout" else "CONNECTION_ERROR"
             break
         loc = r.headers.get("Location", "")
-        hops.append(dict(hop=i + 1, url=cur, status=r.status_code, location=loc, ms=ms, note="",
+        chal = challenge_vendor(r.headers, r.status_code)
+        hops.append(dict(hop=i + 1, url=cur, status=r.status_code, location=loc, ms=ms,
+                         note=(f"bot challenge ({chal}), not the site's real response" if chal else ""),
                          hsts=r.headers.get("Strict-Transport-Security", ""),
                         protocol=(protocols.get(cur) if (protocols and cfg.check_http_version) else "")))
         if r.status_code in REDIRECT_CODES and loc:
@@ -632,6 +667,7 @@ def check_url(url: str, cfg: Config, limiter: HostLimiter, robots: RobotsCache, 
             cur = nxt
             continue
         final, body, final_ms = r, text, ms
+        challenged = chal
         break
 
     n_redirects = sum(1 for h in hops if h["status"] in REDIRECT_CODES and h["location"])
@@ -720,7 +756,9 @@ def check_url(url: str, cfg: Config, limiter: HostLimiter, robots: RobotsCache, 
     intended_error = etype is not None and etype >= 400 and first_status == etype and n_redirects == 0
     if hop_check.startswith("wrong type") or hop_check.startswith("wrong response"):
         add("HOP_TYPE_MISMATCH")
-    if final is not None and final_status != 200 and not intended_error and not hop_check.startswith("wrong response"):
+    if challenged and final_status != 200:
+        add("BOT_CHALLENGE")
+    elif final is not None and final_status != 200 and not intended_error and not hop_check.startswith("wrong response"):
         if final_status in (401, 403, 429):
             add("BOT_REFUSED")
         elif final_status in (404, 410):
